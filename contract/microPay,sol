@@ -1,1 +1,196 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
 
+/**
+ * @title Micropay
+ * @dev A smart contract for handling micropayments with minimal gas fees
+ * @author Micropay Team
+ */
+contract Micropay {
+    
+    // State variables
+    mapping(address => uint256) public balances;
+    mapping(address => mapping(address => uint256)) public allowances;
+    mapping(bytes32 => bool) public processedPayments;
+    
+    address public owner;
+    uint256 public totalDeposits;
+    uint256 public constant MIN_PAYMENT = 0.001 ether; // Minimum micropayment amount
+    uint256 public constant MAX_PAYMENT = 0.1 ether;   // Maximum micropayment amount
+    
+    // Events
+    event Deposit(address indexed user, uint256 amount, uint256 timestamp);
+    event MicropaymentSent(address indexed from, address indexed to, uint256 amount, bytes32 paymentId);
+    event BatchPaymentProcessed(address indexed processor, uint256 totalAmount, uint256 paymentCount);
+    event Withdrawal(address indexed user, uint256 amount, uint256 timestamp);
+    
+    // Modifiers
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function");
+        _;
+    }
+    
+    modifier validAmount(uint256 amount) {
+        require(amount >= MIN_PAYMENT && amount <= MAX_PAYMENT, "Amount outside micropayment range");
+        _;
+    }
+    
+    modifier sufficientBalance(uint256 amount) {
+        require(balances[msg.sender] >= amount, "Insufficient balance");
+        _;
+    }
+    
+    // Constructor
+    constructor() {
+        owner = msg.sender;
+        totalDeposits = 0;
+    }
+    
+    /**
+     * @dev Core Function 1: Deposit funds for micropayments
+     * Users deposit ETH to fund their micropayment account
+     */
+    function deposit() external payable {
+        require(msg.value > 0, "Deposit amount must be greater than 0");
+        
+        balances[msg.sender] += msg.value;
+        totalDeposits += msg.value;
+        
+        emit Deposit(msg.sender, msg.value, block.timestamp);
+    }
+    
+    /**
+     * @dev Core Function 2: Send micropayment
+     * Enables users to send small payments with unique payment IDs to prevent double-spending
+     * @param to Recipient address
+     * @param amount Payment amount in wei
+     * @param paymentId Unique identifier for the payment
+     */
+    function sendMicropayment(
+        address to, 
+        uint256 amount, 
+        bytes32 paymentId
+    ) 
+        external 
+        validAmount(amount) 
+        sufficientBalance(amount) 
+    {
+        require(to != address(0), "Invalid recipient address");
+        require(to != msg.sender, "Cannot send payment to yourself");
+        require(!processedPayments[paymentId], "Payment ID already used");
+        
+        // Process the payment
+        balances[msg.sender] -= amount;
+        balances[to] += amount;
+        processedPayments[paymentId] = true;
+        
+        emit MicropaymentSent(msg.sender, to, amount, paymentId);
+    }
+    
+    /**
+     * @dev Core Function 3: Process batch payments (Gas optimization)
+     * Allows processing multiple micropayments in a single transaction
+     * @param recipients Array of recipient addresses
+     * @param amounts Array of payment amounts
+     * @param paymentIds Array of unique payment identifiers
+     */
+    function processBatchPayments(
+        address[] calldata recipients,
+        uint256[] calldata amounts,
+        bytes32[] calldata paymentIds
+    ) external {
+        require(
+            recipients.length == amounts.length && 
+            amounts.length == paymentIds.length, 
+            "Array lengths must match"
+        );
+        require(recipients.length <= 50, "Batch size too large"); // Prevent gas limit issues
+        
+        uint256 totalAmount = 0;
+        
+        // Calculate total amount needed
+        for (uint256 i = 0; i < amounts.length; i++) {
+            require(amounts[i] >= MIN_PAYMENT && amounts[i] <= MAX_PAYMENT, "Amount outside range");
+            require(recipients[i] != address(0), "Invalid recipient");
+            require(recipients[i] != msg.sender, "Cannot send to yourself");
+            require(!processedPayments[paymentIds[i]], "Payment ID already used");
+            
+            totalAmount += amounts[i];
+        }
+        
+        require(balances[msg.sender] >= totalAmount, "Insufficient balance for batch");
+        
+        // Process all payments
+        balances[msg.sender] -= totalAmount;
+        
+        for (uint256 i = 0; i < recipients.length; i++) {
+            balances[recipients[i]] += amounts[i];
+            processedPayments[paymentIds[i]] = true;
+            
+            emit MicropaymentSent(msg.sender, recipients[i], amounts[i], paymentIds[i]);
+        }
+        
+        emit BatchPaymentProcessed(msg.sender, totalAmount, recipients.length);
+    }
+    
+    /**
+     * @dev Withdraw funds from micropayment account
+     * @param amount Amount to withdraw in wei
+     */
+    function withdraw(uint256 amount) external sufficientBalance(amount) {
+        require(amount > 0, "Withdrawal amount must be greater than 0");
+        
+        balances[msg.sender] -= amount;
+        totalDeposits -= amount;
+        
+        (bool success, ) = payable(msg.sender).call{value: amount}("");
+        require(success, "Withdrawal failed");
+        
+        emit Withdrawal(msg.sender, amount, block.timestamp);
+    }
+    
+    /**
+     * @dev Get user balance
+     * @param user Address to check balance for
+     * @return User's current balance
+     */
+    function getBalance(address user) external view returns (uint256) {
+        return balances[user];
+    }
+    
+    /**
+     * @dev Check if payment ID has been used
+     * @param paymentId Payment ID to check
+     * @return Whether the payment ID has been processed
+     */
+    function isPaymentProcessed(bytes32 paymentId) external view returns (bool) {
+        return processedPayments[paymentId];
+    }
+    
+    /**
+     * @dev Get contract statistics
+     * @return Total deposits in the contract
+     */
+    function getContractStats() external view returns (uint256) {
+        return totalDeposits;
+    }
+    
+    /**
+     * @dev Emergency function to pause contract (owner only)
+     * In case of security issues
+     */
+    function emergencyWithdraw() external onlyOwner {
+        uint256 contractBalance = address(this).balance;
+        require(contractBalance > 0, "No funds to withdraw");
+        
+        (bool success, ) = payable(owner).call{value: contractBalance}("");
+        require(success, "Emergency withdrawal failed");
+    }
+    
+    // Fallback function to handle direct ETH transfers
+    receive() external payable {
+        balances[msg.sender] += msg.value;
+        totalDeposits += msg.value;
+        emit Deposit(msg.sender, msg.value, block.timestamp);
+    }
+}
